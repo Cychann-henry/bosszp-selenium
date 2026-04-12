@@ -28,11 +28,15 @@ from dbutils import DBUtils
 
 uc.Chrome.__del__ = lambda self: None  # type: ignore[misc, assignment]
 
-USE_HEADLESS = os.environ.get("BOSS_SCRAPER_HEADLESS", "1") == "1"
+# 默认有界面：BOSS 常出安全验证，无头难以过检。无头请设 BOSS_SCRAPER_HEADLESS=1 或传 --headless
+USE_HEADLESS = os.environ.get("BOSS_SCRAPER_HEADLESS", "0") == "1"
 WAIT_TIMEOUT = int(os.environ.get("BOSS_SCRAPER_WAIT", "25"))
 # 每处理多少个关键词重启浏览器（防封 / 句柄）
 RESTART_EVERY = int(os.environ.get("BOSS_SCRAPER_RESTART_EVERY", "5"))
 MAX_PAGES_PER_KEYWORD = int(os.environ.get("BOSS_SCRAPER_MAX_PAGES", "10"))
+# 单页内等待「职位列表真正出现」的最长时间（秒），与下面间隔无关，仅防 SPA 未渲染完就往下跑
+LIST_WAIT_MAX = int(os.environ.get("BOSS_WAIT_LIST_MAX", "90"))
+LIST_POLL_INTERVAL = float(os.environ.get("BOSS_WAIT_LIST_POLL", "1.5") or "1.5")
 
 # ---------- 请求节奏（防短时间大量访问触发风控）----------
 # 均为「秒」；每项为 min,max 随机区间。可用环境变量覆盖，格式：8,18 或 8，18
@@ -231,13 +235,16 @@ def _page_looks_empty(driver: WebDriver) -> bool:
     return any(m in src for m in markers)
 
 
-def is_security_challenge_page(driver: WebDriver) -> bool:
-    """BOSS 对异常 IP / 自动化常见拦截：安全验证（极验）。"""
+def _is_security_by_title(driver: WebDriver) -> bool:
+    """仅读 title，不读 page_source（CDP 开销最小）。"""
     try:
-        title = driver.title or ""
+        return "安全验证" in (driver.title or "")
     except Exception:
-        title = ""
-    if "安全验证" in title:
+        return False
+
+
+def is_security_challenge_page(driver: WebDriver) -> bool:
+    if _is_security_by_title(driver):
         return True
     try:
         src = driver.page_source or ""
@@ -248,49 +255,121 @@ def is_security_challenge_page(driver: WebDriver) -> bool:
 
 def resolve_security_challenge(driver: WebDriver, retry_url: str) -> bool:
     """
-    无头模式无法过验证，直接失败；
-    有界面模式下暂停，用户在浏览器中完成验证后按回车继续。
+    检测到安全验证后：
+    - 无头模式直接失败。
+    - 有界面模式**完全停下来**，不做任何 DOM 操作，让极验 JS 安静运行。
+      用户在浏览器里过完验证，Boss 会自动跳回搜索结果页。
+      用户确认看到职位列表后，回终端按回车。
+    - 不再 driver.get() 重新加载（这会触发新一轮验证）。
     """
     if not is_security_challenge_page(driver):
         return True
-    log.error(
-        "当前页面为 BOSS「安全验证」（非职位列表）。"
-        "无头模式无法自动通过；请使用: python boss_selenium.py --visible ..."
+    log.warning(
+        "当前页面为 BOSS「安全验证」。脚本已完全停下，不会操作浏览器。"
     )
     if USE_HEADLESS:
+        log.error("无头模式无法通过安全验证，请勿使用 --headless")
         return False
     print(
-        "\n>>> 请在已打开的浏览器窗口中完成安全验证，"
-        "看到职位列表后再回到此终端按【回车】继续 <<<\n"
+        "\n"
+        "====================================================\n"
+        "  请在浏览器窗口中完成安全验证（点击按钮 / 滑块）。\n"
+        "  Boss 会自动跳转回搜索结果页。\n"
+        "  确认看到【职位列表】后，回到此终端按【回车】继续。\n"
+        "====================================================\n"
     )
     try:
         input()
     except EOFError:
         return False
-    try:
-        driver.get(retry_url)
-    except Exception as e:
-        log.debug("重试加载: %s", e)
+
+    polite_sleep(3.0, 6.0)
+
+    if _is_security_by_title(driver):
+        log.error("按回车后页面仍为安全验证，请在浏览器中重新操作后再按回车")
+        print("\n>>> 仍在验证页，请重新操作后按【回车】 <<<\n")
+        try:
+            input()
+        except EOFError:
+            return False
+        polite_sleep(2.0, 4.0)
+
+    if _is_security_by_title(driver):
+        log.error("二次确认后仍为安全验证页，中止")
         return False
-    polite_sleep(*SLEEP_AFTER_NAV)
-    wait_for_search_shell(driver)
-    if is_security_challenge_page(driver):
-        log.error("验证后仍为安全验证页，请检查网络/IP 或稍后重试")
-        return False
+    log.info("安全验证已通过，继续抓取")
     return True
 
 
-def wait_for_search_shell(driver: WebDriver) -> None:
-    """SPA 搜索页：等待职位卡片渲染或明确空结果。"""
-    wait = _wait(driver, min(WAIT_TIMEOUT, 45))
+def _find_job_rows_raw(driver: WebDriver) -> List[WebElement]:
+    """不打日志，供轮询判断列表是否已挂载。"""
+    els = driver.find_elements(By.CSS_SELECTOR, JOB_LIST_CSS)
+    if els:
+        return els
+    for xp in JOB_LIST_XPATHS:
+        els = driver.find_elements(By.XPATH, xp)
+        if els:
+            return els
+    return []
+
+
+def _document_ready(driver: WebDriver) -> bool:
     try:
-        wait.until(
-            lambda d: bool(d.find_elements(By.CSS_SELECTOR, JOB_LIST_CSS))
-            or _page_looks_empty(d)
-            or ("加载中" not in d.page_source and len(d.page_source) > 80000)
+        return bool(
+            driver.execute_script("return document.readyState === 'complete'")
         )
+    except Exception:
+        return False
+
+
+def wait_for_search_shell(driver: WebDriver) -> None:
+    """
+    等待 SPA 真正把职位列表画出来（或空结果 / 安全验证页）。
+
+    关键设计：
+    - 轮询间隔 5 秒，而非之前的 1.5 秒。
+    - 如果检测到安全验证页，**立即返回**，不再做任何 DOM 查询。
+    - 每轮先做开销最小的 title 检查，其次 CSS 查 job rows，最后才读 page_source。
+    """
+    try:
+        WebDriverWait(driver, 30).until(lambda d: _document_ready(d))
     except TimeoutException:
-        log.warning("等待 SPA 职位列表超时，仍尝试解析")
+        log.warning("document.readyState 未在 30s 内变为 complete，仍继续等待列表")
+
+    poll_interval = max(LIST_POLL_INTERVAL, 5.0)
+    deadline = time.time() + LIST_WAIT_MAX
+    last_log = 0.0
+
+    while time.time() < deadline:
+        if _is_security_by_title(driver):
+            log.info("检测到安全验证页（仅 title），结束列表等待")
+            return
+
+        rows = driver.find_elements(By.CSS_SELECTOR, JOB_LIST_CSS)
+        if rows:
+            log.info("职位列表已挂载，共 %d 个卡片节点", len(rows))
+            polite_sleep(*SLEEP_AFTER_SHELL)
+            return
+
+        if _page_looks_empty(driver):
+            log.info("检测到空结果提示，列表等待结束")
+            polite_sleep(*SLEEP_AFTER_SHELL)
+            return
+
+        now = time.time()
+        if now - last_log >= 15.0:
+            log.info(
+                "仍在等待职位列表渲染… 已等待 %.0fs / 上限 %ds",
+                now - (deadline - LIST_WAIT_MAX),
+                LIST_WAIT_MAX,
+            )
+            last_log = now
+        time.sleep(poll_interval)
+
+    log.warning(
+        "等待 %ds 仍未出现职位列表节点，将尝试解析（可能页面未加载完）",
+        LIST_WAIT_MAX,
+    )
     polite_sleep(*SLEEP_AFTER_SHELL)
 
 
@@ -301,15 +380,10 @@ def scroll_job_list_page(driver: WebDriver) -> None:
 
 
 def find_job_li_elements(driver: WebDriver) -> List[WebElement]:
-    els = driver.find_elements(By.CSS_SELECTOR, JOB_LIST_CSS)
+    els = _find_job_rows_raw(driver)
     if els:
-        log.info("使用 CSS 命中 %d 条: %s", len(els), JOB_LIST_CSS[:60])
+        log.info("使用 CSS/XPath 命中 %d 条职位节点", len(els))
         return els
-    for xp in JOB_LIST_XPATHS:
-        els = driver.find_elements(By.XPATH, xp)
-        if els:
-            log.info("使用职位列表 XPath 命中 %d 条: %s", len(els), xp[:72])
-            return els
     log.error("未找到职位列表节点，请检查选择器或页面是否改版/被拦截")
     return []
 
@@ -646,8 +720,10 @@ def run_scrape(
                 polite_sleep(*SLEEP_AFTER_NAV)
                 wait_for_search_shell(driver)
                 if not resolve_security_challenge(driver, url):
-                    log.error("因安全验证未通过，中止抓取（可改 --visible 后手动过检重试）")
+                    log.error("因安全验证未通过，中止抓取（请用有界面模式手动过检，勿使用 --headless）")
                     return
+                if not driver.find_elements(By.CSS_SELECTOR, JOB_LIST_CSS):
+                    wait_for_search_shell(driver)
                 scroll_job_list_page(driver)
 
                 job_detail = find_job_li_elements(driver)
@@ -763,10 +839,16 @@ def main() -> None:
         default="",
         help="逗号分隔关键词，覆盖默认 SEARCH_TASKS；例：量化实习,数据分析实习",
     )
-    parser.add_argument(
+    disp = parser.add_mutually_exclusive_group()
+    disp.add_argument(
         "--visible",
         action="store_true",
-        help="显示浏览器窗口",
+        help="强制有界面浏览器（覆盖环境变量中的无头设置）",
+    )
+    disp.add_argument(
+        "--headless",
+        action="store_true",
+        help="强制无头模式（后台无窗口，易触发安全验证）",
     )
     parser.add_argument(
         "--max-pages",
@@ -776,8 +858,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     global USE_HEADLESS
-    if args.visible:
+    if args.headless:
+        USE_HEADLESS = True
+    elif args.visible:
         USE_HEADLESS = False
+    else:
+        USE_HEADLESS = os.environ.get("BOSS_SCRAPER_HEADLESS", "0") == "1"
 
     tasks = resolve_search_tasks(args.keywords.strip() or None)
     max_pages = args.max_pages if args.max_pages > 0 else MAX_PAGES_PER_KEYWORD
@@ -804,6 +890,11 @@ def main() -> None:
         SLEEP_PER_JOB_ROW,
         SLEEP_EVERY_N_JOBS,
         SLEEP_BATCH_PAUSE,
+    )
+    log.info(
+        "列表就绪等待: 最长 %ds，轮询间隔 %.1fs（BOSS_WAIT_LIST_MAX / BOSS_WAIT_LIST_POLL）",
+        LIST_WAIT_MAX,
+        LIST_POLL_INTERVAL,
     )
     run_scrape(dry_run=args.dry_run, tasks=tasks, max_pages=max_pages)
 

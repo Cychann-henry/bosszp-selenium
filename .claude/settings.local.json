@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python boss_selenium.py --dry-run --keywords 量化实习 --max-pages 1)"
+    ]
+  }
+}

@@ -43,10 +43,12 @@ pip install -r requirements.txt
 
 | 变量 | 说明 | 默认 |
 |------|------|------|
-| `BOSS_SCRAPER_HEADLESS` | `1` 无头 / `0` 有界面 | `1` |
+| `BOSS_SCRAPER_HEADLESS` | `1` 无头 / `0` 有界面 | **`0`（默认有界面，便于过安全验证）** |
 | `BOSS_SCRAPER_WAIT` | 显式等待秒数 | `25` |
 | `BOSS_SCRAPER_RESTART_EVERY` | 每处理多少个**关键词**重启浏览器 | `5` |
 | `BOSS_SCRAPER_MAX_PAGES` | 每个关键词最多翻页数 | `10` |
+| `BOSS_WAIT_LIST_MAX` | 单次打开搜索页后，**最多等多久**直到职位列表节点出现（与「请求间隔」无关） | `90` |
+| `BOSS_WAIT_LIST_POLL` | 上面等待过程中，每隔多久检查一次 DOM | `1.5` |
 
 **请求间隔（秒，均为 `最小,最大` 随机区间，防短时间大量请求）**
 
@@ -81,28 +83,35 @@ set BOSS_SLEEP_BETWEEN_KEYWORDS=180,360
 
 Boss 对自动化 / 部分 IP 会返回 **「安全验证」**（极验），**无头模式无法手动过检**。
 
-- 若日志提示安全验证或长期「未找到职位列表」，请使用 **`--visible`**，在浏览器中完成验证；终端出现提示时按 **回车** 继续。
-- 调试时可将 `BOSS_SCRAPER_HEADLESS=0` 或始终加 `--visible`。
+- **默认即有界面浏览器**（`BOSS_SCRAPER_HEADLESS` 默认为 `0`），一般**不必再写 `--visible`**。
+- 若你曾把环境变量设成无头，可 **`--visible`** 强制有界面，或在命令行用 **`--headless`** 显式无头。
+- 终端出现「按回车继续」时，先在浏览器里过完验证、看到职位列表，再回车。
 - 若列表仍为空，会生成 **`boss_last_page.html`** 便于本地排查。
 
 ## 3. 运行示例
 
-**冒烟（单关键词、1 页、不写库）**
+**冒烟（单关键词、1 页、不写库；默认有界面）**
 
 ```cmd
-python boss_selenium.py --dry-run --visible --keywords 量化实习 --max-pages 1
+python boss_selenium.py --dry-run --keywords 量化实习 --max-pages 1
 ```
 
 **自定义多个关键词（逗号分隔）**
 
 ```cmd
-python boss_selenium.py --dry-run --visible --keywords 量化实习,数据分析实习 --max-pages 2
+python boss_selenium.py --dry-run --keywords 量化实习,数据分析实习 --max-pages 2
 ```
 
 **默认全部 `SEARCH_TASKS` 并写库**
 
 ```cmd
-python boss_selenium.py --visible
+python boss_selenium.py
+```
+
+**仅在需要后台无窗口时（易触发验证）**
+
+```cmd
+python boss_selenium.py --headless --dry-run --keywords 量化实习 --max-pages 1
 ```
 
 日志：控制台 + `boss_scraper.log`。
