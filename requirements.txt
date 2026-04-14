@@ -1,2 +1,4 @@
 DrissionPage
 psycopg2-binary
+pandas
+pyarrow

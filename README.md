@@ -1,6 +1,6 @@
 # bosszp-selenium
 
-使用 **Python + [DrissionPage](https://www.drissionpage.cn/)** 控制 Chrome（**不依赖 chromedriver**），在 **Boss 直聘** 上按 **关键词 + 上海 + 在校生/实习** 抓取职位，可选进入详情页抓取 **岗位 JD**，写入 **PostgreSQL**（`finance.job_info`，含 `job_jd` 列）。
+使用 **Python + [DrissionPage](https://www.drissionpage.cn/)** 控制 Chrome（**不依赖 chromedriver**），在 **Boss 直聘** 上按 **关键词 + 上海 + 在校生/实习** 抓取职位，可选进入详情页抓取 **岗位 JD**。默认写入本地 **Parquet**（`data/raw/boss_jobs/dt=…/part-*.parquet`）；可选 **`--sink postgres`** 或 **`--sink both`** 写入 **PostgreSQL**（`finance.job_info`，含 `job_jd` 列）。详见 [PARQUET_SOLUTION.md](PARQUET_SOLUTION.md)。
 
 ---
 
@@ -18,7 +18,7 @@
 
 ---
 
-## 核心逻辑（从打开浏览器到入库）
+## 核心逻辑（从打开浏览器到落盘）
 
 以下为 **`boss_selenium.py`** 的主线设计，便于二次开发与排障。
 
@@ -61,8 +61,9 @@
     - 正文优先 `.job-sec-text` 等选择器；再经 **`_clean_jd_text`**：去私用区、顶栏 **`【薪资】` 明文**、去常见「直聘 / boss」插字。  
     - 入库字段 **`job_jd`**（见 `schema.sql`）。
 
-11. **写库**  
-    - 非 `--dry-run` 时 `INSERT` 到 `finance.job_info`；去重键为 `(标题, 公司, 地点)` 等组合。
+11. **落盘**  
+    - 非 `--dry-run` 时：默认 **`--sink parquet`** 按页批量写入 Parquet；**`--sink postgres`** 时逐条 `INSERT` 到 `finance.job_info`；**`--sink both`** 两者都做。  
+    - 进程内去重：优先 **`detail_url`**，否则回退为 `(标题, 公司, 地点)`。
 
 ---
 
@@ -72,7 +73,7 @@
 pip install -r requirements.txt
 ```
 
-当前依赖：**DrissionPage**、**psycopg2-binary**（无 Selenium / undetected-chromedriver）。
+当前依赖：**DrissionPage**、**pandas**、**pyarrow**、**psycopg2-binary**（PostgreSQL 可选；无 Selenium / undetected-chromedriver）。
 
 - **Chrome**：使用本机已安装的 Google Chrome；DrissionPage 通过 CDP 连接，**无需单独配置 chromedriver**。  
 - **PostgreSQL 建表 / 补列**：见 [schema.sql](schema.sql)（含 **`job_jd`** 的 `CREATE` 与 `ADD COLUMN IF NOT EXISTS`）。
@@ -132,7 +133,9 @@ pip install -r requirements.txt
 
 | 参数 | 说明 |
 |------|------|
-| `--dry-run` | 不写库，仅日志/打印 |
+| `--dry-run` | 不写 Parquet/库，仅日志/打印 |
+| `--sink` | `parquet`（默认） / `postgres` / `both` |
+| `--output-dir` | Parquet 根目录，默认 `data/raw/boss_jobs` |
 | `--visible` / `--headless` | 强制有界面 / 无头（二选一；默认读环境变量） |
 | `--keywords a,b` | 逗号分隔关键词，覆盖默认 `SEARCH_TASKS` |
 | `--max-pages N` | 每关键词最多 N 页；`0` 表示用 `BOSS_SCRAPER_MAX_PAGES` |

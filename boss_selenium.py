@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Boss直聘 针对性关键词搜索抓取（上海 + 在校生/实习 + PostgreSQL）。
+"""Boss直聘 针对性关键词搜索抓取（上海 + 在校生/实习 + Parquet/PostgreSQL）。
 使用 DrissionPage 控制浏览器，不依赖 chromedriver，天然绕过 cdc_ 检测。
 """
 from __future__ import annotations
@@ -13,13 +13,14 @@ import random
 import re
 import sys
 import time
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError
 
 from dbutils import DBUtils
+from parquet_sink import write_jobs_to_parquet
 
 
 def _configure_stdio_encoding() -> None:
@@ -646,7 +647,48 @@ def _ele_texts(parent, locator: str) -> list[str]:
         return []
 
 
-def parse_job_card(card, category_label: str, keyword: str, today: str) -> Optional[tuple[Any, ...]]:
+def parse_salary_text(raw: str) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """从 Boss 薪资文案中尽力解析数值区间与单位；无法解析时返回 (None, None, None)。"""
+    if not raw:
+        return None, None, None
+    s = _strip_private_use_area((raw or "").strip())
+    if not s or s in ("面议", "薪资面议", "无", "无数据"):
+        return None, None, None
+    fw_digits = "０１２３４５６７８９－"
+    fw_ascii = "0123456789-"
+    s = s.translate(str.maketrans(fw_digits, fw_ascii))
+
+    if "元/天" in s or "元每天" in s or ("/天" in s and "元" in s):
+        nums = re.findall(r"(\d+(?:\.\d+)?)", s)
+        if len(nums) >= 2:
+            return float(nums[0]), float(nums[1]), "yuan_per_day"
+        if len(nums) == 1:
+            v = float(nums[0])
+            return v, v, "yuan_per_day"
+        return None, None, None
+
+    if "万" in s and re.search(r"\d", s):
+        nums = re.findall(r"(\d+(?:\.\d+)?)", s)
+        if len(nums) >= 2:
+            return float(nums[0]) * 10000, float(nums[1]) * 10000, "yuan_per_month"
+        if len(nums) == 1:
+            v = float(nums[0]) * 10000
+            return v, v, "yuan_per_month"
+
+    if re.search(r"[Kk千]", s):
+        nums = re.findall(r"(\d+(?:\.\d+)?)", s)
+        if len(nums) >= 2:
+            return float(nums[0]) * 1000, float(nums[1]) * 1000, "yuan_per_month"
+        if len(nums) == 1:
+            v = float(nums[0]) * 1000
+            return v, v, "yuan_per_month"
+
+    return None, None, None
+
+
+def parse_job_card(
+    card, category_label: str, keyword: str, crawl_date: str
+) -> Optional[Dict[str, Any]]:
     if not _card_has_job_detail_link(card):
         return None
     job_title = (
@@ -678,35 +720,67 @@ def parse_job_card(card, category_label: str, keyword: str, today: str) -> Optio
         or "无"
     )
 
-    job_salary_range = (
+    salary_text = (
         _ele_text(card, "css:span.salary")
         or _ele_text(card, "css:span.job-salary")
     )
+    salary_min, salary_max, salary_unit = parse_salary_text(salary_text)
 
     tag_list = _ele_texts(card, "css:ul.tag-list li")
     job_experience = tag_list[0] if len(tag_list) > 0 else "无"
     job_education = tag_list[1] if len(tag_list) > 1 else "无"
     job_skills = ",".join(tag_list[2:]) if len(tag_list) > 2 else "无"
+    job_tags = ",".join(tag_list) if tag_list else "无"
 
     province = province_for_location(job_location)
-    return (
-        category_label,
-        keyword,
-        job_title,
-        province,
-        job_location,
-        job_company,
-        job_industry,
-        job_finance,
-        job_scale,
-        job_welfare,
-        job_salary_range,
-        job_experience,
-        job_education,
-        job_skills,
-        "",  # job_jd，由 run_scrape 在 --fetch-jd 时填入
-        today,
+    city = job_location.split("·")[0].strip() if job_location else ""
+
+    company_url = ""
+    try:
+        cel = card.ele("css:h3.company-name a", timeout=0.35)
+        if cel:
+            company_url = _boss_abs_url((cel.attr("href") or "").strip())
+    except Exception:
+        pass
+
+    publish_text = (
+        _ele_text(card, "css:span.job-time")
+        or _ele_text(card, "css:span.job-pub-time")
+        or _ele_text(card, "css:.job-time")
+        or ""
     )
+
+    detail_url = job_detail_url_from_card(card)
+    crawl_time = datetime.datetime.now().replace(microsecond=0).isoformat()
+
+    return {
+        "source": "boss",
+        "category": category_label,
+        "keyword": keyword,
+        "city": city,
+        "job_title": job_title,
+        "province": province,
+        "job_location": job_location,
+        "job_company": job_company,
+        "job_industry": job_industry,
+        "job_finance": job_finance,
+        "job_scale": job_scale,
+        "job_welfare": job_welfare,
+        "salary_text": salary_text,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "salary_unit": salary_unit,
+        "job_experience": job_experience,
+        "job_education": job_education,
+        "job_skills": job_skills,
+        "job_tags": job_tags,
+        "job_jd": "",
+        "detail_url": detail_url,
+        "company_url": company_url,
+        "publish_text": publish_text,
+        "crawl_time": crawl_time,
+        "crawl_date": crawl_date,
+    }
 
 
 def province_for_location(job_location: str) -> str:
@@ -736,6 +810,40 @@ def resolve_search_tasks(keywords_arg: Optional[str]) -> List[Tuple[str, str]]:
     return list(SEARCH_TASKS)
 
 
+def row_dedupe_key(row: Dict[str, Any]) -> tuple[Any, ...]:
+    u = (row.get("detail_url") or "").strip()
+    if u:
+        return ("url", u)
+    return (
+        "legacy",
+        row["job_title"],
+        row["job_company"],
+        row["job_location"],
+    )
+
+
+def dict_to_pg_tuple(row: Dict[str, Any]) -> tuple[Any, ...]:
+    """与 build_insert_sql 列顺序一致，供 PostgreSQL 写入。"""
+    return (
+        row["category"],
+        row["keyword"],
+        row["job_title"],
+        row["province"],
+        row["job_location"],
+        row["job_company"],
+        row["job_industry"],
+        row["job_finance"],
+        row["job_scale"],
+        row["job_welfare"],
+        row["salary_text"],
+        row["job_experience"],
+        row["job_education"],
+        row["job_skills"],
+        row.get("job_jd") or "",
+        row["crawl_date"],
+    )
+
+
 # --------------- 主流程 ---------------
 
 def run_scrape(
@@ -745,18 +853,35 @@ def run_scrape(
     fetch_jd: bool = False,
     max_jd: int = 0,
     max_cards: int = 0,
+    sink: str = "parquet",
+    output_dir: str = "data/raw/boss_jobs",
 ) -> None:
     today = datetime.date.today().strftime("%Y-%m-%d")
+    sink = (sink or "parquet").strip().lower()
+    if sink not in ("parquet", "postgres", "both"):
+        raise ValueError("sink 必须是 parquet、postgres 或 both")
+
+    sink_parquet = sink in ("parquet", "both") and not dry_run
+    sink_pg = sink in ("postgres", "both") and not dry_run
+
     db: Optional[DBUtils] = None
     insert_sql = build_insert_sql()
-    if not dry_run:
+    if sink_pg:
         cfg = get_pg_config()
         db = DBUtils(
             cfg["host"], cfg["user"], cfg["password"], cfg["db"], port=cfg["port"],
         )
         log.info("已连接 PostgreSQL: %s/%s 表 %s", cfg["host"], cfg["db"], _qualified_job_table())
+    elif dry_run:
+        log.info("dry-run：不写 Parquet / PostgreSQL")
+    elif sink == "parquet":
+        log.info("sink=parquet：写入 %s", output_dir)
+    elif sink == "postgres":
+        log.info("sink=postgres：仅 PostgreSQL")
+    else:
+        log.info("sink=both：Parquet %s + PostgreSQL", output_dir)
 
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[Any, ...]] = set()
     page: Optional[ChromiumPage] = None
     task_list = list(tasks)
     try:
@@ -838,7 +963,7 @@ def run_scrape(
                     log.info("本页将最多打开 %d 个详情页抓取 JD", max_jd)
 
                 first_row = parse_job_card(job_cards[0], category_label, keyword, today)
-                first_title = first_row[2] if first_row else None
+                first_title = first_row["job_title"] if first_row else None
                 if first_title and prev_first_title and first_title == prev_first_title:
                     log.info("关键词 %s 第 %d 页与上页首条重复，停止分页", keyword, pg)
                     break
@@ -846,6 +971,7 @@ def run_scrape(
 
                 parsed_page = 0
                 jd_done = 0
+                page_rows: list[Dict[str, Any]] = []
                 for j_i, card in enumerate(job_cards):
                     if SLEEP_EVERY_N_JOBS > 0 and j_i > 0 and j_i % SLEEP_EVERY_N_JOBS == 0:
                         log.debug("已解析 %d 条卡片，批量停顿", j_i)
@@ -859,25 +985,60 @@ def run_scrape(
                         if u:
                             jd_text = fetch_job_jd_in_new_tab(page, u, list_tab_id)
                             jd_done += 1
-                            row = row[:14] + (jd_text,) + (row[15],)
+                            row["job_jd"] = jd_text
                             if dry_run and jd_text:
                                 log.info(
                                     "DRY [JD] %s | %d 字 | 预览: %s",
-                                    row[2],
+                                    row["job_title"],
                                     len(jd_text),
                                     jd_text[:180].replace("\r", " ").replace("\n", " "),
                                 )
-                    dedupe_key = (row[2], row[5], row[4])
-                    if dedupe_key in seen:
+                    dk = row_dedupe_key(row)
+                    if dk in seen:
                         continue
-                    seen.add(dedupe_key)
+                    seen.add(dk)
                     parsed_page += 1
+                    page_rows.append(row)
                     if dry_run:
-                        log.info("DRY [行] %s | %s | %s | %s", row[2], row[4], row[5], row[10])
-                    else:
+                        log.info(
+                            "DRY [行] %s | %s | %s | %s",
+                            row["job_title"],
+                            row["job_location"],
+                            row["job_company"],
+                            row["salary_text"],
+                        )
+                    elif sink_pg:
                         assert db is not None
-                        db.insert_data(insert_sql, row)
-                    print(category_label, keyword, *row[2:15], sep=" | ")
+                        db.insert_data(insert_sql, dict_to_pg_tuple(row))
+                    print(
+                        category_label,
+                        keyword,
+                        row["job_title"],
+                        row["province"],
+                        row["job_location"],
+                        row["job_company"],
+                        row["job_industry"],
+                        row["job_finance"],
+                        row["job_scale"],
+                        row["job_welfare"],
+                        row["salary_text"],
+                        row["job_experience"],
+                        row["job_education"],
+                        row["job_skills"],
+                        row["job_jd"],
+                        sep=" | ",
+                    )
+
+                if sink_parquet and page_rows:
+                    out = write_jobs_to_parquet(
+                        page_rows, output_dir, today, f"{keyword}_p{pg}"
+                    )
+                    if out is not None:
+                        log.info(
+                            "Parquet 已写入: %s（本页 %d 条）",
+                            out,
+                            len(page_rows),
+                        )
 
                 log.info(
                     "关键词 %s 第 %d 页 解析 %d 条（累计去重后总条数 %d）",
@@ -906,14 +1067,27 @@ def run_scrape(
                 log.debug("page.quit: %s", e)
         if db is not None:
             db.close()
-            log.info("数据库连接已关闭")
+            log.info("PostgreSQL 连接已关闭")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Boss直聘 上海在校生/实习 针对性关键词搜索抓取（DrissionPage）"
     )
-    parser.add_argument("--dry-run", action="store_true", help="不写库，仅打印/日志")
+    parser.add_argument("--dry-run", action="store_true", help="不写 Parquet/库，仅打印/日志")
+    parser.add_argument(
+        "--sink",
+        type=str,
+        default="parquet",
+        choices=("parquet", "postgres", "both"),
+        help="存储目标：parquet（默认）、postgres、或 both",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="data/raw/boss_jobs",
+        help="Parquet 输出根目录（会写入 dt=YYYY-MM-DD 子目录）",
+    )
     parser.add_argument(
         "--keywords", type=str, default="",
         help="逗号分隔关键词，覆盖默认 SEARCH_TASKS；例：量化实习,数据分析实习",
@@ -928,7 +1102,7 @@ def main() -> None:
     parser.add_argument(
         "--fetch-jd",
         action="store_true",
-        help="新标签打开详情页抓取 JD，写入 job_jd（需已在库中执行 schema 里的 ADD COLUMN）",
+        help="新标签打开详情页抓取 JD，写入 job_jd 列（PostgreSQL 需已执行 schema 的 ADD COLUMN）",
     )
     parser.add_argument(
         "--max-jd",
@@ -954,8 +1128,16 @@ def main() -> None:
     tasks = resolve_search_tasks(args.keywords.strip() or None)
     max_pages = args.max_pages if args.max_pages > 0 else MAX_PAGES_PER_KEYWORD
     log.info(
-        "headless=%s wait=%ds restart_every=%d max_pages=%d dry_run=%s tasks=%d",
-        USE_HEADLESS, WAIT_TIMEOUT, RESTART_EVERY, max_pages, args.dry_run, len(tasks),
+        "headless=%s wait=%ds restart_every=%d max_pages=%d dry_run=%s sink=%s "
+        "output_dir=%s tasks=%d",
+        USE_HEADLESS,
+        WAIT_TIMEOUT,
+        RESTART_EVERY,
+        max_pages,
+        args.dry_run,
+        args.sink,
+        args.output_dir,
+        len(tasks),
     )
     log.info(
         "间隔(秒,×mult=%s): after_nav=%s after_shell=%s scroll=%s "
@@ -976,6 +1158,8 @@ def main() -> None:
         fetch_jd=args.fetch_jd,
         max_jd=max_jd,
         max_cards=max_cards,
+        sink=args.sink,
+        output_dir=args.output_dir.strip() or "data/raw/boss_jobs",
     )
 
 
