@@ -1,3 +1,2 @@
-undetected-chromedriver
+DrissionPage
 psycopg2-binary
-selenium

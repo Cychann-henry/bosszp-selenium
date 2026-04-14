@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS finance.job_info (
     job_experience VARCHAR(255),
     job_education VARCHAR(255),
     job_skills TEXT,
+    job_jd TEXT,
     create_time VARCHAR(50)
 );
 
@@ -37,4 +38,8 @@ COMMENT ON COLUMN finance.job_info.job_salary_range IS '薪资范围';
 COMMENT ON COLUMN finance.job_info.job_experience IS '工作年限';
 COMMENT ON COLUMN finance.job_info.job_education IS '学历要求';
 COMMENT ON COLUMN finance.job_info.job_skills IS '技能要求';
+COMMENT ON COLUMN finance.job_info.job_jd IS '职位详情页 JD（可选抓取）';
 COMMENT ON COLUMN finance.job_info.create_time IS '抓取时间';
+
+-- 若表在加 job_jd 列之前已创建，在 psql 中执行一次即可补列（重复执行安全）
+ALTER TABLE finance.job_info ADD COLUMN IF NOT EXISTS job_jd TEXT;
