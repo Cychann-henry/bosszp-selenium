@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Boss直聘 针对性关键词搜索抓取（上海 + 在校生/实习 + Parquet/PostgreSQL）。
+"""Boss直聘 针对性关键词搜索抓取（上海 + 在校生/实习 + Parquet）。
 使用 DrissionPage 控制浏览器，不依赖 chromedriver，天然绕过 cdc_ 检测。
 """
 from __future__ import annotations
@@ -19,7 +19,6 @@ from urllib.parse import quote_plus
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError
 
-from dbutils import DBUtils
 from parquet_sink import write_jobs_to_parquet
 
 
@@ -109,24 +108,6 @@ JOB_CARD_CSS = (
     "ul.job-list-box > li, "
     "div.search-job-result li.job-card-wrapper"
 )
-
-
-def _qualified_job_table() -> str:
-    schema = (os.environ.get("PGJOB_SCHEMA") or "finance").strip() or "finance"
-    if not schema.replace("_", "").isalnum():
-        raise ValueError("PGJOB_SCHEMA 只能包含字母、数字与下划线")
-    return f"{schema}.job_info"
-
-
-def build_insert_sql() -> str:
-    t = _qualified_job_table()
-    return f"""
-INSERT INTO {t}(
-    category, sub_category, job_title, province, job_location, job_company,
-    job_industry, job_finance, job_scale, job_welfare, job_salary_range,
-    job_experience, job_education, job_skills, job_jd, create_time
-) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-"""
 
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -791,18 +772,6 @@ def province_for_location(job_location: str) -> str:
     return ""
 
 
-# --------------- DB ---------------
-
-def get_pg_config() -> dict:
-    return {
-        "host": os.environ.get("PGHOST", "localhost"),
-        "port": int(os.environ.get("PGPORT", "5432")),
-        "user": os.environ.get("PGUSER", "postgres"),
-        "password": os.environ.get("PGPASSWORD") or "pg621",
-        "db": os.environ.get("PGDATABASE", "postgres"),
-    }
-
-
 def resolve_search_tasks(keywords_arg: Optional[str]) -> List[Tuple[str, str]]:
     if keywords_arg:
         parts = [p.strip() for p in keywords_arg.split(",") if p.strip()]
@@ -822,28 +791,6 @@ def row_dedupe_key(row: Dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def dict_to_pg_tuple(row: Dict[str, Any]) -> tuple[Any, ...]:
-    """与 build_insert_sql 列顺序一致，供 PostgreSQL 写入。"""
-    return (
-        row["category"],
-        row["keyword"],
-        row["job_title"],
-        row["province"],
-        row["job_location"],
-        row["job_company"],
-        row["job_industry"],
-        row["job_finance"],
-        row["job_scale"],
-        row["job_welfare"],
-        row["salary_text"],
-        row["job_experience"],
-        row["job_education"],
-        row["job_skills"],
-        row.get("job_jd") or "",
-        row["crawl_date"],
-    )
-
-
 # --------------- 主流程 ---------------
 
 def run_scrape(
@@ -853,33 +800,14 @@ def run_scrape(
     fetch_jd: bool = False,
     max_jd: int = 0,
     max_cards: int = 0,
-    sink: str = "parquet",
     output_dir: str = "data/raw/boss_jobs",
 ) -> None:
     today = datetime.date.today().strftime("%Y-%m-%d")
-    sink = (sink or "parquet").strip().lower()
-    if sink not in ("parquet", "postgres", "both"):
-        raise ValueError("sink 必须是 parquet、postgres 或 both")
-
-    sink_parquet = sink in ("parquet", "both") and not dry_run
-    sink_pg = sink in ("postgres", "both") and not dry_run
-
-    db: Optional[DBUtils] = None
-    insert_sql = build_insert_sql()
-    if sink_pg:
-        cfg = get_pg_config()
-        db = DBUtils(
-            cfg["host"], cfg["user"], cfg["password"], cfg["db"], port=cfg["port"],
-        )
-        log.info("已连接 PostgreSQL: %s/%s 表 %s", cfg["host"], cfg["db"], _qualified_job_table())
-    elif dry_run:
-        log.info("dry-run：不写 Parquet / PostgreSQL")
-    elif sink == "parquet":
-        log.info("sink=parquet：写入 %s", output_dir)
-    elif sink == "postgres":
-        log.info("sink=postgres：仅 PostgreSQL")
+    sink_parquet = not dry_run
+    if dry_run:
+        log.info("dry-run：不写 Parquet")
     else:
-        log.info("sink=both：Parquet %s + PostgreSQL", output_dir)
+        log.info("写入 Parquet：%s", output_dir)
 
     seen: set[tuple[Any, ...]] = set()
     page: Optional[ChromiumPage] = None
@@ -1007,9 +935,6 @@ def run_scrape(
                             row["job_company"],
                             row["salary_text"],
                         )
-                    elif sink_pg:
-                        assert db is not None
-                        db.insert_data(insert_sql, dict_to_pg_tuple(row))
                     print(
                         category_label,
                         keyword,
@@ -1065,23 +990,13 @@ def run_scrape(
                 page.quit()
             except Exception as e:
                 log.debug("page.quit: %s", e)
-        if db is not None:
-            db.close()
-            log.info("PostgreSQL 连接已关闭")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Boss直聘 上海在校生/实习 针对性关键词搜索抓取（DrissionPage）"
     )
-    parser.add_argument("--dry-run", action="store_true", help="不写 Parquet/库，仅打印/日志")
-    parser.add_argument(
-        "--sink",
-        type=str,
-        default="parquet",
-        choices=("parquet", "postgres", "both"),
-        help="存储目标：parquet（默认）、postgres、或 both",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="不写 Parquet，仅打印/日志")
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -1102,7 +1017,7 @@ def main() -> None:
     parser.add_argument(
         "--fetch-jd",
         action="store_true",
-        help="新标签打开详情页抓取 JD，写入 job_jd 列（PostgreSQL 需已执行 schema 的 ADD COLUMN）",
+        help="新标签打开详情页抓取 JD，写入 job_jd 列",
     )
     parser.add_argument(
         "--max-jd",
@@ -1128,14 +1043,13 @@ def main() -> None:
     tasks = resolve_search_tasks(args.keywords.strip() or None)
     max_pages = args.max_pages if args.max_pages > 0 else MAX_PAGES_PER_KEYWORD
     log.info(
-        "headless=%s wait=%ds restart_every=%d max_pages=%d dry_run=%s sink=%s "
+        "headless=%s wait=%ds restart_every=%d max_pages=%d dry_run=%s "
         "output_dir=%s tasks=%d",
         USE_HEADLESS,
         WAIT_TIMEOUT,
         RESTART_EVERY,
         max_pages,
         args.dry_run,
-        args.sink,
         args.output_dir,
         len(tasks),
     )
@@ -1158,7 +1072,6 @@ def main() -> None:
         fetch_jd=args.fetch_jd,
         max_jd=max_jd,
         max_cards=max_cards,
-        sink=args.sink,
         output_dir=args.output_dir.strip() or "data/raw/boss_jobs",
     )
 
