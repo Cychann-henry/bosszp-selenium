@@ -10,6 +10,10 @@
 
 - `data/raw/boss_jobs/dt=YYYY-MM-DD/part-*.parquet`
 
+处理后分析数据（推荐主数据源）：
+
+- `data/processed/quant_intern/jobs_filtered.parquet`
+
 ## 字段总览
 
 | 字段 | 类型 | 示例 | 说明 |
@@ -53,3 +57,9 @@
 - `publish_text` 为页面文案，不保证统一格式
 - `salary_*` 解析失败会为 `null`
 - `company_url`、`job_jd` 可能为空（取决于页面结构和抓取参数）
+
+## JD 回填说明
+
+- 可使用 `python boss_selenium.py --backfill-jd --input "<parquet_path>"` 对已有 parquet 就地回填 `job_jd`
+- 当前 JD 抓取采用固定标签页复用（重复导航 URL），不再每条 JD 新建/关闭标签页
+- 不启用窗口移屏/最小化方案（作为备选策略保留）

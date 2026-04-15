@@ -438,6 +438,52 @@ def _clean_jd_text(raw: str) -> str:
     return s.strip()
 
 
+def _extract_jd_from_tab(tab) -> str:
+    jd = (
+        _ele_text(tab, "css:.job-sec-text")
+        or _ele_text(tab, "css:div.job-sec-text")
+        or _ele_text(tab, "css:.job-detail-box .text")
+        or _ele_text(tab, "css:div.job-detail")
+    )
+    if not jd:
+        try:
+            h = tab.html or ""
+            jd = h[:30000] if h else ""
+        except Exception:
+            jd = ""
+    jd_raw = (jd or "").strip()[:80000]
+    extra = ""
+    try:
+        sal = (
+            _ele_text(tab, "css:.job-info-primary .salary", "")
+            or _ele_text(tab, "css:.job-info .salary", "")
+            or _ele_text(tab, "css:.job-banner .salary", "")
+            or _ele_text(tab, "css:span.salary", "")
+        )
+        sal = _strip_private_use_area((sal or "").strip())
+        if sal and re.search(r"[0-9０-９零一二三四五六七八九十两]", sal):
+            extra = "【薪资】" + sal + "\n\n"
+        elif sal and ("元" in sal or "薪" in sal or "K" in sal or "k" in sal):
+            extra = "【薪资】" + sal + "\n\n"
+    except Exception:
+        pass
+    return _clean_jd_text((extra + jd_raw).strip()[:80000])
+
+
+def fetch_jd_reuse_tab(tab, detail_url: str) -> str:
+    """复用同一标签页抓取 JD，避免频繁创建/关闭标签页导致抢焦点。"""
+    if not detail_url:
+        return ""
+    try:
+        tab.get(detail_url)
+        tab.wait.doc_loaded()
+        polite_sleep(1.2, 2.5)
+        return _extract_jd_from_tab(tab)
+    except Exception as e:
+        log.debug("抓取 JD 失败: %s", e)
+        return ""
+
+
 def fetch_job_jd_in_new_tab(
     page: ChromiumPage, detail_url: str, list_tab_id: str
 ) -> str:
@@ -449,35 +495,7 @@ def fetch_job_jd_in_new_tab(
         sub = page.new_tab(detail_url, background=True)
         sub.wait.doc_loaded()
         polite_sleep(1.2, 2.5)
-        jd = (
-            _ele_text(sub, "css:.job-sec-text")
-            or _ele_text(sub, "css:div.job-sec-text")
-            or _ele_text(sub, "css:.job-detail-box .text")
-            or _ele_text(sub, "css:div.job-detail")
-        )
-        if not jd:
-            try:
-                h = sub.html or ""
-                jd = h[:30000] if h else ""
-            except Exception:
-                jd = ""
-        jd_raw = (jd or "").strip()[:80000]
-        extra = ""
-        try:
-            sal = (
-                _ele_text(sub, "css:.job-info-primary .salary", "")
-                or _ele_text(sub, "css:.job-info .salary", "")
-                or _ele_text(sub, "css:.job-banner .salary", "")
-                or _ele_text(sub, "css:span.salary", "")
-            )
-            sal = _strip_private_use_area((sal or "").strip())
-            if sal and re.search(r"[0-9０-９零一二三四五六七八九十两]", sal):
-                extra = "【薪资】" + sal + "\n\n"
-            elif sal and ("元" in sal or "薪" in sal or "K" in sal or "k" in sal):
-                extra = "【薪资】" + sal + "\n\n"
-        except Exception:
-            pass
-        return _clean_jd_text((extra + jd_raw).strip()[:80000])
+        return _extract_jd_from_tab(sub)
     except Exception as e:
         log.debug("抓取 JD 失败: %s", e)
         return ""
@@ -875,10 +893,12 @@ def run_scrape(
     task_list = list(tasks)
     try:
         page = init_browser()
+        jd_tab = page.new_tab("about:blank", background=True) if fetch_jd else None
         for kw_idx, (keyword, category_label) in enumerate(task_list):
             if kw_idx > 0 and kw_idx % RESTART_EVERY == 0:
                 log.info("已处理 %d 个关键词，重启浏览器…", kw_idx)
                 page = restart_browser(page)
+                jd_tab = page.new_tab("about:blank", background=True) if fetch_jd else None
 
             log.info("%s 关键词 [%s] 分组=%s", today, keyword, category_label)
             pg = 1
@@ -950,7 +970,7 @@ def run_scrape(
                         raw_n,
                     )
                 if fetch_jd and max_jd > 0:
-                    log.info("本页将最多打开 %d 个详情页抓取 JD", max_jd)
+                    log.info("本页将最多抓取 %d 条 JD（复用固定标签页）", max_jd)
 
                 first_row = parse_job_card(job_cards[0], category_label, keyword, today)
                 first_title = first_row["job_title"] if first_row else None
@@ -973,7 +993,9 @@ def run_scrape(
                     if fetch_jd and max_jd > 0 and jd_done < max_jd:
                         u = job_detail_url_from_card(card)
                         if u:
-                            jd_text = fetch_job_jd_in_new_tab(page, u, list_tab_id)
+                            if jd_tab is None:
+                                jd_tab = page.new_tab("about:blank", background=True)
+                            jd_text = fetch_jd_reuse_tab(jd_tab, u)
                             jd_done += 1
                             row["job_jd"] = jd_text
                             if dry_run and jd_text:
@@ -1121,16 +1143,18 @@ def backfill_jd(
         return
 
     page: Optional[ChromiumPage] = None
+    jd_tab = None
     done = 0
     try:
         page = init_browser()
+        jd_tab = page.new_tab("about:blank", background=True)
         for i, idx in enumerate(todo_idx, start=1):
             if i > 1 and restart_every > 0 and (i - 1) % restart_every == 0:
                 log.info("JD 补抓已处理 %d 条，重启浏览器", i - 1)
                 page = restart_browser(page)
-            list_tab_id = page.tab_id
+                jd_tab = page.new_tab("about:blank", background=True)
             url = str(df.at[idx, "detail_url"]).strip()
-            text = fetch_job_jd_in_new_tab(page, url, list_tab_id)
+            text = fetch_jd_reuse_tab(jd_tab, url)
             if text:
                 df.at[idx, "job_jd"] = text
             done += 1

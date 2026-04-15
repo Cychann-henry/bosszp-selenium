@@ -65,6 +65,20 @@ python boss_selenium.py --visible --keywords "量化实习,量化研究员实习
 ```
 
 说明：`--fetch-jd` 会打开详情页，速度明显变慢。
+当前实现为**固定标签页复用**：只创建一个 JD 标签页并反复切换 URL，不再每条 JD 新建/关闭标签页，可减少抢焦点中断。
+
+### 5.3 对已有数据补抓 JD（推荐）
+
+用于你已经有 parquet 数据，但 `job_jd` 为空的情况（例如先抓列表后补全 JD）：
+
+```cmd
+python boss_selenium.py --backfill-jd --input "data/processed/quant_intern/jobs_filtered.parquet"
+```
+
+说明：
+- 该命令会就地更新输入文件的 `job_jd` 字段
+- 默认会清理对应日期的 raw 分片与旧分析文件；若仅测试可加 `--no-cleanup-legacy`
+- 同样采用固定标签页复用策略，减少窗口抢焦点
 
 ## 6. 分批运行模板（推荐）
 
@@ -109,6 +123,7 @@ for f in sorted(p.glob("*.parquet")):
 - 页面出现安全验证：在浏览器中完成验证后继续
 - 某关键词结果为 0：属正常情况，不一定有匹配岗位
 - 文件名中文显示乱码：终端编码问题，不影响 Parquet 内容本身
+- 补抓 JD 时偶发窗口抢焦点：当前已改为固定标签页复用。若仍偶发，通常发生在浏览器重启瞬间，可适当调大 `restart_every` 降低重启频次
 
 ## 9. 推荐默认配置（可长期沿用）
 

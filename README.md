@@ -26,6 +26,9 @@ pip install -r requirements.txt
 - `--max-cards N`：每页最多处理真实职位数
 - `--fetch-jd`：抓取详情页 JD 到 `job_jd`
 - `--max-jd N`：每页最多抓取 JD 数
+- `--backfill-jd`：对已有 parquet 按 `detail_url` 回填 JD（就地更新）
+- `--input`：`--backfill-jd` 模式输入文件（默认 `data/processed/quant_intern/jobs_filtered.parquet`）
+- `--no-cleanup-legacy`：`--backfill-jd` 完成后不清理旧 raw 分片/旧分析文件
 
 ## 输出字段（Parquet）
 
@@ -51,3 +54,13 @@ python boss_selenium.py --dry-run --visible --keywords 量化实习 --max-pages 
 ```cmd
 python boss_selenium.py --visible --keywords 量化实习,数据分析实习 --max-pages 2 --fetch-jd
 ```
+
+```cmd
+python boss_selenium.py --backfill-jd --input "data/processed/quant_intern/jobs_filtered.parquet"
+```
+
+## JD 抓取行为说明
+
+- `--fetch-jd` 与 `--backfill-jd` 均采用**固定标签页复用**策略：启动后创建 1 个 JD 标签页，后续仅切换 URL 抓取。
+- 不再每条 JD 执行“新建标签页 -> 关闭标签页 -> 切回原标签页”，可显著降低窗口抢焦点问题。
+- 当前不启用窗口移屏/最小化方案（方案 B 仅作为备选，不默认使用）。
