@@ -13,9 +13,11 @@ import random
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
 
+import pandas as pd
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError
 
@@ -90,16 +92,19 @@ _GEEK_SEARCH_SEGMENT = (
 SEARCH_TASKS: List[Tuple[str, str]] = [
     ("量化实习", "量化/资管"),
     ("量化研究员实习", "量化/资管"),
+    ("量化研究实习", "量化/资管"),
+    ("量化开发实习", "量化/资管"),
+    ("量化交易实习", "量化/资管"),
+    ("量化策略实习", "量化/资管"),
+    ("因子研究实习", "量化/资管"),
+    ("Alpha研究实习", "量化/资管"),
     ("资产管理实习", "量化/资管"),
     ("投资实习", "量化/资管"),
     ("金融工程实习", "证券/金工"),
-    ("金工实习", "证券/金工"),
-    ("证券实习", "证券/金工"),
-    ("QD实习", "量化/资管"),
-    ("QR实习", "量化/资管"),
-    ("数据开发实习", "互联网"),
-    ("数据分析实习", "互联网"),
-    ("产品经理实习", "互联网"),
+    ("风控建模实习", "量化/资管"),
+    ("私募实习", "量化/资管"),
+    ("对冲基金实习", "量化/资管"),
+    ("证券研究实习", "证券/金工"),
 ]
 
 JOB_CARD_CSS = (
@@ -388,6 +393,19 @@ def _strip_private_use_area(s: str) -> str:
     return "".join(c for c in s if not (0xE000 <= ord(c) <= 0xF8FF))
 
 
+def _decode_boss_pua_digits(s: str) -> str:
+    """
+    Boss 常把薪资数字渲染到私用区字符（例如 U+E031 => 1）。
+    先把可识别的数字映射回阿拉伯数字，再执行后续清洗/解析。
+    """
+    if not s:
+        return s
+    mapping = {ord(chr(0xE030 + i)): str(i) for i in range(10)}
+    # 线上字体偶发把 "7" 放到 U+E03A（已在真实抓取样本中观察到）。
+    mapping[0xE03A] = "7"
+    return s.translate(mapping)
+
+
 def _clean_jd_text(raw: str) -> str:
     """去掉详情页里站点插字、私用区图标字，便于入库与阅读。"""
     if not raw:
@@ -489,6 +507,8 @@ def _page_still_loading_shell(page: ChromiumPage) -> bool:
 def _find_job_cards(page: ChromiumPage) -> list:
     """查找职位卡片；/geek/jobs 与 /geek/job 的 class 可能不同，多路选择器 + job_detail 兜底。"""
     selectors: List[str] = [
+        "css:li.job-card-box",
+        "css:div.job-card-wrap li.job-card-box",
         "css:li.job-card-wrapper",
         "css:div.job-card-left",
         "css:ul.job-list-box > li",
@@ -496,8 +516,8 @@ def _find_job_cards(page: ChromiumPage) -> list:
         "xpath://li[contains(@class,'job-card-wrapper')]",
         "xpath://li[contains(@class,'job-card') and contains(@class,'item')]",
         "css:li[class*='job-card-wrapper']",
-        "css:li[class*='job-card']",
-        "css:[class*='job-card-wrap']",
+        "css:li[class*='job-card'][class*='box']",
+        "css:[class*='job-card-wrap'] li",
         # 下列易把卡片内每个 li 都当成一条，仅当命中数较少时才采用（否则靠外层选择器 + URL 去重）
         "xpath://li[.//a[contains(@href,'job_detail')]]",
         "xpath://div[contains(@class,'job-card')][.//a[contains(@href,'job_detail')]]",
@@ -632,7 +652,8 @@ def parse_salary_text(raw: str) -> tuple[Optional[float], Optional[float], Optio
     """从 Boss 薪资文案中尽力解析数值区间与单位；无法解析时返回 (None, None, None)。"""
     if not raw:
         return None, None, None
-    s = _strip_private_use_area((raw or "").strip())
+    s = _decode_boss_pua_digits((raw or "").strip())
+    s = _strip_private_use_area(s)
     if not s or s in ("面议", "薪资面议", "无", "无数据"):
         return None, None, None
     fw_digits = "０１２３４５６７８９－"
@@ -673,19 +694,23 @@ def parse_job_card(
     if not _card_has_job_detail_link(card):
         return None
     job_title = (
-        _ele_text(card, "css:span.job-name")
-        or _ele_text(card, "css:a.job-name span")
-        or _ele_text(card, "css:div.job-title span")
+        _ele_text(card, "css:a.job-name")
+        or _ele_text(card, "css:div.job-title a.job-name")
+        or _ele_text(card, "css:div.job-info a.job-name")
+        or _ele_text(card, "css:span.job-name")
     )
     if not job_title:
         return None
 
     job_location = (
-        _ele_text(card, "css:span.job-area")
+        _ele_text(card, "css:span.company-location")
+        or _ele_text(card, "css:span.job-area")
         or _ele_text(card, "css:span.job-area-wrapper")
     )
     job_company = (
-        _ele_text(card, "css:h3.company-name a")
+        _ele_text(card, "css:span.boss-name")
+        or _ele_text(card, "css:a.boss-info span.boss-name")
+        or _ele_text(card, "css:h3.company-name a")
         or _ele_text(card, "css:span.company-name")
         or _ele_text(card, "css:div.company-info a")
     )
@@ -696,21 +721,40 @@ def parse_job_card(
     job_scale = company_tags[2] if len(company_tags) > 2 else "无"
 
     job_welfare = (
-        _ele_text(card, "css:div.job-card-footer.clearfix div.info-desc")
+        _ele_text(card, "css:div.job-welfare")
+        or _ele_text(card, "css:div.info-desc")
+        or _ele_text(card, "css:div.job-card-footer.clearfix div.info-desc")
         or _ele_text(card, "css:div.job-card-footer span")
         or "无"
     )
 
     salary_text = (
-        _ele_text(card, "css:span.salary")
-        or _ele_text(card, "css:span.job-salary")
+        _ele_text(card, "css:span.job-salary")
+        or _ele_text(card, "css:div.job-title span.job-salary")
+        or _ele_text(card, "css:span.salary")
     )
+    salary_text = _decode_boss_pua_digits(salary_text)
     salary_min, salary_max, salary_unit = parse_salary_text(salary_text)
 
     tag_list = _ele_texts(card, "css:ul.tag-list li")
-    job_experience = tag_list[0] if len(tag_list) > 0 else "无"
-    job_education = tag_list[1] if len(tag_list) > 1 else "无"
-    job_skills = ",".join(tag_list[2:]) if len(tag_list) > 2 else "无"
+    edu_re = re.compile(r"(学历不限|本科|硕士|博士|大专|中专|高中)")
+    if len(tag_list) >= 3:
+        # 新版卡片结构常见：第1项=出勤，第2项=时长，第3项=学历
+        job_experience = ",".join(tag_list[:2])
+        job_education = tag_list[2]
+        job_skills = ",".join(tag_list[3:]) if len(tag_list) > 3 else "无"
+    elif len(tag_list) == 2:
+        if edu_re.search(tag_list[1]):
+            job_experience = tag_list[0]
+            job_education = tag_list[1]
+        else:
+            job_experience = ",".join(tag_list)
+            job_education = "无"
+        job_skills = "无"
+    else:
+        job_experience = tag_list[0] if tag_list else "无"
+        job_education = "无"
+        job_skills = "无"
     job_tags = ",".join(tag_list) if tag_list else "无"
 
     province = province_for_location(job_location)
@@ -718,15 +762,19 @@ def parse_job_card(
 
     company_url = ""
     try:
-        cel = card.ele("css:h3.company-name a", timeout=0.35)
+        cel = (
+            card.ele("css:a.boss-info", timeout=0.35)
+            or card.ele("css:h3.company-name a", timeout=0.35)
+        )
         if cel:
             company_url = _boss_abs_url((cel.attr("href") or "").strip())
     except Exception:
         pass
 
     publish_text = (
-        _ele_text(card, "css:span.job-time")
-        or _ele_text(card, "css:span.job-pub-time")
+        _ele_text(card, "css:span.job-pub-time")
+        or _ele_text(card, "css:span.time")
+        or _ele_text(card, "css:span.job-time")
         or _ele_text(card, "css:.job-time")
         or ""
     )
@@ -789,6 +837,19 @@ def row_dedupe_key(row: Dict[str, Any]) -> tuple[Any, ...]:
         row["job_company"],
         row["job_location"],
     )
+
+
+def _save_debug_page_html(output_dir: str, keyword: str, page_no: int, html: str) -> None:
+    """保存每页渲染后的 HTML，便于定位站点 DOM 变更。"""
+    safe_kw = re.sub(r'[<>:"/\\|?*]+', "_", (keyword or "").strip()) or "kw"
+    debug_dir = Path(output_dir) / "_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    p = debug_dir / f"{safe_kw}_p{page_no}.html"
+    try:
+        p.write_text(html or "", encoding="utf-8")
+        log.info("已保存调试 HTML: %s", p)
+    except OSError as e:
+        log.warning("保存调试 HTML 失败: %s", e)
 
 
 # --------------- 主流程 ---------------
@@ -859,6 +920,7 @@ def run_scrape(
                 cards = _find_job_cards(page)
                 job_cards = filter_real_job_cards(cards)
                 job_cards = dedupe_job_cards_by_detail_url(job_cards)
+                _save_debug_page_html(output_dir, keyword, pg, page.html or "")
 
                 if not cards:
                     try:
@@ -992,6 +1054,116 @@ def run_scrape(
                 log.debug("page.quit: %s", e)
 
 
+def _save_backfill_checkpoint(df: pd.DataFrame, output_path: Path) -> None:
+    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(output_path)
+
+
+def cleanup_legacy_outputs(input_path: Path, crawl_dates: list[str]) -> None:
+    old_outputs = [
+        Path("data/processed/quant_intern/tech_stack_summary.parquet"),
+        Path("data/processed/quant_intern/salary_overview.parquet"),
+        Path("data/processed/quant_intern/market_report.md"),
+    ]
+    removed = 0
+    for p in old_outputs:
+        if p.exists():
+            p.unlink()
+            removed += 1
+            log.info("已删除旧分析文件: %s", p)
+
+    raw_root = Path("data/raw/boss_jobs")
+    for d in sorted(set([str(x).strip() for x in crawl_dates if str(x).strip()])):
+        part = raw_root / f"dt={d}"
+        if part.exists() and part.is_dir():
+            files = list(part.glob("*.parquet"))
+            for f in files:
+                f.unlink()
+                removed += 1
+            try:
+                part.rmdir()
+                log.info("已删除原始分区目录: %s", part)
+            except OSError:
+                log.info("原始分区目录非空，已删除 parquet 分片: %s", part)
+    log.info("旧文件清理完成，删除 %d 个文件", removed)
+
+
+def backfill_jd(
+    input_path: str,
+    restart_every: int = 120,
+    checkpoint_every: int = 20,
+    cleanup_legacy: bool = True,
+) -> None:
+    src = Path(input_path)
+    if not src.exists():
+        raise FileNotFoundError(f"输入文件不存在: {src}")
+    df = pd.read_parquet(src)
+    if "detail_url" not in df.columns:
+        raise ValueError("输入 parquet 缺少 detail_url 列，无法补抓 JD")
+    if "job_jd" not in df.columns:
+        df["job_jd"] = ""
+
+    detail = df["detail_url"].fillna("").astype(str).str.strip()
+    jd = df["job_jd"].fillna("").astype(str).str.strip()
+    todo_idx = df.index[(detail != "") & (jd == "")].tolist()
+    total = len(todo_idx)
+    log.info("JD 补抓总任务数: %d（文件总行数 %d）", total, len(df))
+    if total == 0:
+        log.info("没有需要补抓的 JD，跳过抓取。")
+        if cleanup_legacy:
+            crawl_dates = (
+                df["crawl_date"].fillna("").astype(str).tolist()
+                if "crawl_date" in df.columns
+                else []
+            )
+            cleanup_legacy_outputs(src, crawl_dates)
+        return
+
+    page: Optional[ChromiumPage] = None
+    done = 0
+    try:
+        page = init_browser()
+        for i, idx in enumerate(todo_idx, start=1):
+            if i > 1 and restart_every > 0 and (i - 1) % restart_every == 0:
+                log.info("JD 补抓已处理 %d 条，重启浏览器", i - 1)
+                page = restart_browser(page)
+            list_tab_id = page.tab_id
+            url = str(df.at[idx, "detail_url"]).strip()
+            text = fetch_job_jd_in_new_tab(page, url, list_tab_id)
+            if text:
+                df.at[idx, "job_jd"] = text
+            done += 1
+
+            if done % checkpoint_every == 0:
+                _save_backfill_checkpoint(df, src)
+                log.info(
+                    "JD 补抓进度: %d/%d（最近一条 %d 字）",
+                    done,
+                    total,
+                    len(text),
+                )
+            polite_sleep(0.8, 1.8)
+    finally:
+        _save_backfill_checkpoint(df, src)
+        if page is not None:
+            try:
+                page.quit()
+            except Exception as e:
+                log.debug("page.quit: %s", e)
+
+    still_empty = int(df["job_jd"].fillna("").astype(str).str.strip().eq("").sum())
+    log.info("JD 补抓结束，文件已更新: %s", src)
+    log.info("补抓后仍为空的 job_jd 条数: %d", still_empty)
+    if cleanup_legacy:
+        crawl_dates = (
+            df["crawl_date"].fillna("").astype(str).tolist()
+            if "crawl_date" in df.columns
+            else []
+        )
+        cleanup_legacy_outputs(src, crawl_dates)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Boss直聘 上海在校生/实习 针对性关键词搜索抓取（DrissionPage）"
@@ -1031,6 +1203,22 @@ def main() -> None:
         default=0,
         help="每页最多处理几条真实职位（过滤评价块后截断）。例：测试前 15 条 + JD 用 --max-cards 15 --fetch-jd",
     )
+    parser.add_argument(
+        "--backfill-jd",
+        action="store_true",
+        help="读取已有 parquet 的 detail_url，逐条补抓 JD 并就地更新 job_jd",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="data/processed/quant_intern/jobs_filtered.parquet",
+        help="--backfill-jd 模式的输入 parquet 路径",
+    )
+    parser.add_argument(
+        "--no-cleanup-legacy",
+        action="store_true",
+        help="--backfill-jd 完成后不删除 raw 分片和旧分析文件",
+    )
     args = parser.parse_args()
     global USE_HEADLESS
     if args.headless:
@@ -1063,6 +1251,14 @@ def main() -> None:
     )
     max_jd = max(0, args.max_jd)
     max_cards = max(0, args.max_cards)
+    if args.backfill_jd:
+        backfill_jd(
+            input_path=args.input.strip() or "data/processed/quant_intern/jobs_filtered.parquet",
+            restart_every=120,
+            checkpoint_every=20,
+            cleanup_legacy=not args.no_cleanup_legacy,
+        )
+        return
     if args.fetch_jd and max_jd == 0:
         max_jd = max_cards if max_cards > 0 else 5
     run_scrape(
